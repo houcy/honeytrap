@@ -1,4 +1,4 @@
-package server
+package bolt
 
 import (
 	"encoding/binary"
@@ -17,8 +17,8 @@ type Bolted struct {
 	db   *bolt.DB
 }
 
-// NewBolted returns a new instance of a Bolted type.
-func NewBolted(dbName string, buckets ...string) (*Bolted, error) {
+// NewBoltDB returns a new instance of a bolt.DB type.
+func NewBoltDB(dbName string, buckets ...string) (*bolt.DB, error) {
 	db, err := bolt.Open(fmt.Sprintf("%s.db", dbName), 0600, &bolt.Options{
 		Timeout: 5 * time.Second,
 	})
@@ -27,12 +27,8 @@ func NewBolted(dbName string, buckets ...string) (*Bolted, error) {
 		return nil, err
 	}
 
-	var b Bolted
-	b.name = dbName
-	b.db = db
-
 	// Create buckets for db.
-	if terr := b.db.Update(func(tx *bolt.Tx) error {
+	if terr := db.Update(func(tx *bolt.Tx) error {
 		for _, bucket := range buckets {
 			if _, err := tx.CreateBucketIfNotExists([]byte(bucket)); err != nil {
 				return err
@@ -44,14 +40,33 @@ func NewBolted(dbName string, buckets ...string) (*Bolted, error) {
 		return nil, terr
 	}
 
-	return &b, nil
+	return db, nil
+}
+
+// AddBucket adds the giving bucket into the db instance.
+func AddBucket(db *bolt.DB, bucket []byte) error {
+
+	// Create buckets for db.
+	terr := db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if terr != nil {
+		return terr
+	}
+
+	return nil
 }
 
 // GetSize returns the giving size of the total items in a given bucket.
-func (d *Bolted) GetSize(bucket []byte) (int, error) {
+func GetSize(db *bolt.DB, bucket []byte) (int, error) {
 	var total int
 
-	if terr := d.db.View(func(tx *bolt.Tx) error {
+	if terr := db.View(func(tx *bolt.Tx) error {
 		bu := tx.Bucket(bucket)
 		total = int(bu.Stats().KeyN)
 		return nil
@@ -65,11 +80,11 @@ func (d *Bolted) GetSize(bucket []byte) (int, error) {
 // Get returns the giving buckets based on the provided cursor point and size.
 // If the `from` and `length` are -1 then all keys and values are returned, else
 // the provided range will be used.
-func (d *Bolted) Get(bucket []byte, from int, length int) ([]event.Event, error) {
+func Get(db *bolt.DB, bucket []byte, from int, length int) ([]event.Event, error) {
 	var list []event.Event
 	// var total int
 
-	if err := d.db.View(func(tx *bolt.Tx) error {
+	if err := db.View(func(tx *bolt.Tx) error {
 		bu := tx.Bucket(bucket)
 		cu := bu.Cursor()
 
@@ -145,12 +160,12 @@ func (d *Bolted) Get(bucket []byte, from int, length int) ([]event.Event, error)
 }
 
 // Save attempts to save the series of passed in events into the underline db.
-func (d *Bolted) Save(bucket []byte, events ...event.Event) error {
+func Save(db *bolt.DB, bucket []byte, events []event.Event) error {
 	if events == nil {
 		return nil
 	}
 
-	return d.db.Update(func(tx *bolt.Tx) error {
+	return db.Update(func(tx *bolt.Tx) error {
 		bu := tx.Bucket(bucket)
 
 		for _, event := range events {
@@ -170,11 +185,6 @@ func (d *Bolted) Save(bucket []byte, events ...event.Event) error {
 
 		return nil
 	})
-}
-
-// Close closes the db and ends the session being used.
-func (d *Bolted) Close() error {
-	return d.db.Close()
 }
 
 //================================================================================

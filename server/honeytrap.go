@@ -24,9 +24,11 @@ import (
 	proxies "github.com/honeytrap/honeytrap/proxies"
 	_ "github.com/honeytrap/honeytrap/proxies/ssh" // TODO: Add comment
 
+	"github.com/dimfeld/httptreemux"
 	"github.com/honeytrap/honeytrap/pushers/event"
 
 	pushers "github.com/honeytrap/honeytrap/pushers"
+	"github.com/honeytrap/honeytrap/pushers/backends/bolt"
 	_ "github.com/honeytrap/honeytrap/pushers/backends/console"       // Registers stdout backend.
 	_ "github.com/honeytrap/honeytrap/pushers/backends/elasticsearch" // Registers elasticsearch backend.
 	_ "github.com/honeytrap/honeytrap/pushers/backends/fschannel"     // Registers file backend.
@@ -40,13 +42,17 @@ import (
 
 var log = logging.MustGetLogger("Honeytrap")
 
+// acceptAllOrigins defines a function to use to validate origin request.
+func acceptAllOrigins(r *http.Request) bool { return true }
+
 // Honeytrap defines a struct which coordinates the internal logic for the honeytrap
 // container infrastructure.
 type Honeytrap struct {
 	config *config.Config
 
-	events    pushers.Channel
 	honeycast *Honeycast
+	consula   *bolt.Consula
+	events    pushers.Channel
 	director  director.Director
 	manager   *director.ContainerConnections
 }
@@ -61,6 +67,23 @@ func New(conf *config.Config) *Honeytrap {
 	// Initialize all channels within the provided config.
 	pushers.ChannelsFrom(conf, bus)
 
+	getEventReqs := make(chan bolt.GetRequest)
+	saveEventReqs := make(chan bolt.SaveRequest)
+	addBucketReqs := make(chan bolt.NewBucketRequest)
+	bucketSizeReqs := make(chan bolt.BucketSizeResquest)
+
+	consula, err := bolt.New(
+		fmt.Sprintf("%s.db", conf.Token),
+		bolt.GetRequests(getEventReqs),
+		bolt.SaveRequests(saveEventReqs),
+		bolt.NewBucketRequests(addBucketReqs),
+		bolt.BucketSizeRequests(bucketSizeReqs),
+	)
+
+	if err != nil {
+		panic(fmt.Sprintf("Unknown create consula: %q", err))
+	}
+
 	dir, err := director.NewDirector(conf.Director, conf, bus)
 	if err != nil {
 		panic(fmt.Sprintf("Unknown director %q: %q", conf.Director, err))
@@ -68,21 +91,36 @@ func New(conf *config.Config) *Honeytrap {
 
 	manager := director.NewContainerConnections()
 
-	honeycast := NewHoneycast(conf, manager, dir, HoneycastAssets(&assetfs.AssetFS{
+	var honeycast Honeycast
+	honeycast.Config = conf
+	honeycast.Director = dir
+	honeycast.Manager = manager
+	honeycast.TreeMux = httptreemux.New()
+	honeycast.GetEventReqs = getEventReqs
+	honeycast.SaveEventReqs = saveEventReqs
+	honeycast.AddBucketReqs = addBucketReqs
+	honeycast.BucketSizeReqs = bucketSizeReqs
+	honeycast.Socket = NewSocketcast(conf, getEventReqs, acceptAllOrigins)
+
+	honeycast.Assets = http.FileServer(&assetfs.AssetFS{
 		Asset:     web.Asset,
 		AssetDir:  web.AssetDir,
 		AssetInfo: web.AssetInfo,
 		Prefix:    web.Prefix,
-	}))
+	})
 
-	bus.Subscribe(honeycast)
+	honeycast.initRoutes()
+	honeycast.initEvents()
+
+	bus.Subscribe(&honeycast)
 
 	return &Honeytrap{
 		config:    conf,
 		director:  dir,
 		events:    bus,
-		honeycast: honeycast,
 		manager:   manager,
+		consula:   consula,
+		honeycast: &honeycast,
 	}
 }
 

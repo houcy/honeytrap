@@ -4,17 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"regexp"
 	"sync"
 	"time"
 
 	"github.com/dimfeld/httptreemux"
-	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/websocket"
 	"github.com/honeytrap/honeytrap/config"
 	"github.com/honeytrap/honeytrap/director"
+	"github.com/honeytrap/honeytrap/pushers/backends/bolt"
 	"github.com/honeytrap/honeytrap/pushers/event"
 )
 
@@ -29,150 +28,74 @@ var (
 
 //=============================================================================================================
 
-// HoneycastOption defines a function which is used to enchance/add configurational
-// options for use with the honeycast API.
-type HoneycastOption func(*Honeycast)
-
-// AcceptAllOrigins defines a function to use to validate origin request.
-func AcceptAllOrigins(r *http.Request) bool { return true }
-
-// HoneycastAssets sets the assets http.Handler for use with a Honeycast instance.
-func HoneycastAssets(assets *assetfs.AssetFS) HoneycastOption {
-	return func(hc *Honeycast) {
-		hc.assets = http.FileServer(assets)
-	}
-}
-
-//=============================================================================================================
-
 // Honeycast defines a struct which exposes methods to handle api related service
 // responses.
 type Honeycast struct {
 	*httptreemux.TreeMux
-	bolted   *Bolted
-	socket   *Socketcast
-	assets   http.Handler
-	config   *config.Config
-	director director.Director
-	manager  *director.ContainerConnections
+	Socket   *Socketcast
+	Assets   http.Handler
+	Config   *config.Config
+	Director director.Director
+	Manager  *director.ContainerConnections
+
+	GetEventReqs   chan bolt.GetRequest
+	SaveEventReqs  chan bolt.SaveRequest
+	BucketSizeReqs chan bolt.BucketSizeResquest
+	AddBucketReqs  chan bolt.NewBucketRequest
 }
 
-// NewHoneycast returns a new instance of a Honeycast struct.
-func NewHoneycast(config *config.Config, manager *director.ContainerConnections, dir director.Director, options ...HoneycastOption) *Honeycast {
-
-	// Create the database we desire.
-	// TODO: Should we really panic here, it makes sense to do that, since it's the server
-	// right?
-	bolted, err := NewBolted(fmt.Sprintf("%s-bolted", config.Token), event.ContainersSensorName, event.ConnectionSensorName, event.ServiceSensorName, event.SessionSensorName, event.PingSensorName, event.DataSensorName, event.ErrorsSensorName, event.EventSensorName)
-	if err != nil {
-		log.Errorf("Failed to created BoltDB session: %+q", err)
-		panic(err)
-	}
-
-	var hc Honeycast
-	hc.config = config
-	hc.bolted = bolted
-	hc.director = dir
-	hc.manager = manager
-	hc.TreeMux = httptreemux.New()
-	hc.socket = NewSocketcast(config, bolted, AcceptAllOrigins)
+func (h *Honeycast) initRoutes() {
 
 	// Register endpoints for events.
-	hc.TreeMux.Handle("GET", "/", hc.Index)
-	hc.TreeMux.Handle("GET", "/events", hc.Events)
-	hc.TreeMux.Handle("GET", "/sessions", hc.Sessions)
-	hc.TreeMux.Handle("GET", "/ws", hc.socket.ServeHandle)
+	h.TreeMux.Handle("GET", "/", h.Index)
+	h.TreeMux.Handle("GET", "/events", h.Events)
+	h.TreeMux.Handle("GET", "/sessions", h.Sessions)
+	h.TreeMux.Handle("GET", "/ws", h.Socket.ServeHandle)
 
 	// Register endpoints for metrics details
-	hc.TreeMux.Handle("GET", "/metrics/attackers", hc.Attackers)
-	hc.TreeMux.Handle("GET", "/metrics/containers", hc.Containers)
+	h.TreeMux.Handle("GET", "/metrics/attackers", h.Attackers)
+	h.TreeMux.Handle("GET", "/metrics/containers", h.Containers)
 
 	// Register endpoints for container interaction details
-	hc.TreeMux.Handle("DELETE", "/containers/clients/:container_id", hc.ContainerClientDelete)
-	hc.TreeMux.Handle("DELETE", "/containers/connections/:container_id", hc.ContainerConnectionsDelete)
-
-	return &hc
+	h.TreeMux.Handle("DELETE", "/containers/clients/:container_id", h.ContainerClientDelete)
+	h.TreeMux.Handle("DELETE", "/containers/connections/:container_id", h.ContainerConnectionsDelete)
 }
 
-// ContainerClientDelete services the request to delete a giving containers client detail without
-// affecting the existing connections.
-func (h *Honeycast) ContainerClientDelete(w http.ResponseWriter, r *http.Request, params map[string]string) {
-	if err := h.manager.RemoveClient(params["container_id"]); err != nil {
-		log.Error("Honeycast API : Operation Failed : %+q", err)
-		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
-		return
+func (h *Honeycast) initEvents() {
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: sessionBucket,
 	}
 
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ContainerConnectionsDelete services the request to delete a giving containers client detail and
-// related existing connections.
-func (h *Honeycast) ContainerConnectionsDelete(w http.ResponseWriter, r *http.Request, params map[string]string) {
-	if err := h.manager.RemoveClientWithConns(params["container_id"]); err != nil {
-		log.Error("Honeycast API : Operation Failed : %+q", err)
-		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
-		return
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: eventsBucket,
 	}
 
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// AttackerResponse defines the response delivered for requesting list of all
-// current container users.
-type AttackerResponse struct {
-	Total     int                     `json:"total"`
-	Attackers []director.ClientDetail `json:"attackers"`
-}
-
-// Attackers delivers metrics from the underlying API about specific users
-// of the current running dataset.
-func (h *Honeycast) Attackers(w http.ResponseWriter, r *http.Request, params map[string]string) {
-	users := h.manager.ListClients()
-
-	response := AttackerResponse{
-		Total:     len(users),
-		Attackers: users,
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: pingBucket,
 	}
 
-	w.WriteHeader(http.StatusOK)
-
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "\t")
-
-	if err := encoder.Encode(response); err != nil {
-		log.Error("Honeycast API : Operation Failed : %+q", err)
-		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-// ContainerResponse defines the response delivered for requesting list of all containers
-// lunched.
-type ContainerResponse struct {
-	Total      int                        `json:"total"`
-	Containers []director.ContainerDetail `json:"containers"`
-}
-
-// Containers delivers metrics from the underlying API about specific data related to containers
-// started, stopped and running.
-func (h *Honeycast) Containers(w http.ResponseWriter, r *http.Request, params map[string]string) {
-	containers := h.director.ListContainers()
-
-	response := ContainerResponse{
-		Total:      len(containers),
-		Containers: containers,
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte("events"),
 	}
 
-	w.WriteHeader(http.StatusOK)
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte(event.DataSensorName),
+	}
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "\t")
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte(event.ContainersSensorName),
+	}
 
-	if err := encoder.Encode(response); err != nil {
-		log.Error("Honeycast API : Operation Failed : %+q", err)
-		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
-		return
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte(event.ConnectionSensorName),
+	}
+
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte(event.ServiceSensorName),
+	}
+
+	h.AddBucketReqs <- bolt.NewBucketRequest{
+		Bucket: []byte(event.ErrorsSensorName),
 	}
 }
 
@@ -207,40 +130,129 @@ func (h *Honeycast) Send(ev event.Event) {
 	}
 
 	// Batch deliver both sessions and events data to all connected
-	h.socket.events <- events
-	h.socket.sessions <- sessions
+	h.Socket.events <- events
+	h.Socket.sessions <- sessions
 
-	//  Batch save all events into individual buckets.
-	if terr := h.bolted.Save(sessionBucket, sessions...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save session events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: sessionBucket,
+		Events: sessions,
 	}
 
-	if terr := h.bolted.Save([]byte(event.ErrorsSensorName), serrors...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save errors events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Events: events,
+		Bucket: eventsBucket,
 	}
 
-	if terr := h.bolted.Save([]byte(event.ConnectionSensorName), connections...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save connections events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: pingBucket,
+		Events: pings,
 	}
 
-	if terr := h.bolted.Save([]byte(event.ServiceSensorName), services...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save service events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: []byte(event.DataSensorName),
+		Events: data,
 	}
 
-	if terr := h.bolted.Save([]byte(event.ContainersSensorName), containers...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save data events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: []byte(event.ContainersSensorName),
+		Events: data,
 	}
 
-	if terr := h.bolted.Save([]byte(event.DataSensorName), data...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save data events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: []byte(event.ConnectionSensorName),
+		Events: connections,
 	}
 
-	if terr := h.bolted.Save([]byte(event.PingSensorName), pings...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save ping events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: []byte(event.ServiceSensorName),
+		Events: services,
 	}
 
-	if terr := h.bolted.Save(eventsBucket, events...); terr != nil {
-		log.Errorf("Honeycast API : Failed to save events to db: %+q", terr)
+	h.SaveEventReqs <- bolt.SaveRequest{
+		Bucket: []byte(event.ErrorsSensorName),
+		Events: serrors,
+	}
+}
+
+// ContainerClientDelete services the request to delete a giving containers client detail without
+// affecting the existing connections.
+func (h *Honeycast) ContainerClientDelete(w http.ResponseWriter, r *http.Request, params map[string]string) {
+	if err := h.Manager.RemoveClient(params["container_id"]); err != nil {
+		log.Error("Honeycast API : Operation Failed : %+q", err)
+		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerConnectionsDelete services the request to delete a giving containers client detail and
+// related existing connections.
+func (h *Honeycast) ContainerConnectionsDelete(w http.ResponseWriter, r *http.Request, params map[string]string) {
+	if err := h.Manager.RemoveClientWithConns(params["container_id"]); err != nil {
+		log.Error("Honeycast API : Operation Failed : %+q", err)
+		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AttackerResponse defines the response delivered for requesting list of all
+// current container users.
+type AttackerResponse struct {
+	Total     int                     `json:"total"`
+	Attackers []director.ClientDetail `json:"attackers"`
+}
+
+// Attackers delivers metrics from the underlying API about specific users
+// of the current running dataset.
+func (h *Honeycast) Attackers(w http.ResponseWriter, r *http.Request, params map[string]string) {
+	users := h.Manager.ListClients()
+
+	response := AttackerResponse{
+		Total:     len(users),
+		Attackers: users,
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "\t")
+
+	if err := encoder.Encode(response); err != nil {
+		log.Error("Honeycast API : Operation Failed : %+q", err)
+		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+// ContainerResponse defines the response delivered for requesting list of all containers
+// lunched.
+type ContainerResponse struct {
+	Total      int                        `json:"total"`
+	Containers []director.ContainerDetail `json:"containers"`
+}
+
+// Containers delivers metrics from the underlying API about specific data related to containers
+// started, stopped and running.
+func (h *Honeycast) Containers(w http.ResponseWriter, r *http.Request, params map[string]string) {
+	containers := h.Director.ListContainers()
+
+	response := ContainerResponse{
+		Total:      len(containers),
+		Containers: containers,
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "\t")
+
+	if err := encoder.Encode(response); err != nil {
+		log.Error("Honeycast API : Operation Failed : %+q", err)
+		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 }
 
@@ -257,10 +269,17 @@ func (h *Honeycast) Events(w http.ResponseWriter, r *http.Request, params map[st
 }
 
 func (h *Honeycast) bucketFind(bucket []byte, w http.ResponseWriter, r *http.Request, params map[string]string) {
-	total, err := h.bolted.GetSize(bucket)
-	if err != nil {
-		log.Error("Honeycast API : Operation Failed : %+q", err)
-		http.Error(w, "Operation Failed: "+err.Error(), http.StatusInternalServerError)
+	resChan := make(chan bolt.BucketSizeResponse)
+
+	h.BucketSizeReqs <- bolt.BucketSizeResquest{
+		Bucket:   bucket,
+		Response: resChan,
+	}
+
+	bucketResponse := <-resChan
+	if bucketResponse.Error != nil {
+		log.Error("Honeycast API : Operation Failed : %+q", bucketResponse.Error)
+		http.Error(w, "Operation Failed: "+bucketResponse.Error.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -273,20 +292,30 @@ func (h *Honeycast) bucketFind(bucket []byte, w http.ResponseWriter, r *http.Req
 	}
 
 	var res EventResponse
-	res.Total = total
 	res.Page = req.Page
+	res.Total = bucketResponse.Size
 	res.ResponsePerPage = req.ResponsePerPage
 
-	var terr error
+	resEventChan := make(chan bolt.GetResponse)
 
 	if req.ResponsePerPage <= 0 || req.Page <= 0 {
 
-		res.Events, terr = h.bolted.Get(bucket, -1, -1)
-		if terr != nil {
-			log.Error("Honeycast API : Invalid Response received : %+q", err)
-			http.Error(w, "Invalid 'From' parameter: "+terr.Error(), http.StatusInternalServerError)
+		h.GetEventReqs <- bolt.GetRequest{
+			From:     -1,
+			Total:    -1,
+			Bucket:   bucket,
+			Response: resEventChan,
+		}
+
+		eventRes := <-resEventChan
+
+		res.Events = eventRes.Events
+		if eventRes.Error != nil {
+			log.Error("Honeycast API : Invalid Response received : %+q", eventRes.Error)
+			http.Error(w, "Invalid 'From' parameter: "+eventRes.Error.Error(), http.StatusInternalServerError)
 			return
 		}
+
 	} else {
 		length := req.ResponsePerPage * req.Page
 		index := (length / 2)
@@ -295,34 +324,42 @@ func (h *Honeycast) bucketFind(bucket []byte, w http.ResponseWriter, r *http.Req
 			index++
 		}
 
-		var terr error
-		var events, filteredEvents []event.Event
+		h.GetEventReqs <- bolt.GetRequest{
+			From:     index,
+			Total:    length,
+			Bucket:   bucket,
+			Response: resEventChan,
+		}
 
-		events, terr = h.bolted.Get(bucket, index, length)
-		if terr != nil {
-			log.Error("Honeycast API : Invalid Response received : %+q", err)
-			http.Error(w, "Invalid 'From' parameter: "+terr.Error(), http.StatusInternalServerError)
+		eventRes := <-resEventChan
+
+		if eventRes.Error != nil {
+			log.Error("Honeycast API : Invalid Response received : %+q", eventRes.Error)
+			http.Error(w, "Invalid 'From' parameter: "+eventRes.Error.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		{
+			var filteredEvents []event.Event
+
 			doTypeMatch := len(req.TypeFilters) != 0
 			doSensorMatch := len(req.SensorFilters) != 0
 
 			if doTypeMatch || doSensorMatch {
-				for _, event := range events {
+
+				for _, event := range eventRes.Events {
 
 					eventType, ok := event["type"].(string)
 					if !ok {
-						log.Error("Honeycast API : Invalid Response received : %+q", err)
-						http.Error(w, "Invalid 'Type' parameter, string allowed only: "+terr.Error(), http.StatusInternalServerError)
+						log.Error("Honeycast API : Invalid Response received : %+q", eventRes.Error)
+						http.Error(w, "Invalid 'Type' parameter, string allowed only: "+eventRes.Error.Error(), http.StatusInternalServerError)
 						return
 					}
 
 					eventSensor, ok := event["sensor"].(string)
 					if !ok {
-						log.Error("Honeycast API : Invalid Response received : %+q", err)
-						http.Error(w, "Invalid 'Sensor' parameter, string allowed only: "+terr.Error(), http.StatusInternalServerError)
+						log.Error("Honeycast API : Invalid Response received : %+q", eventRes.Error)
+						http.Error(w, "Invalid 'Type' parameter, string allowed only: "+eventRes.Error.Error(), http.StatusInternalServerError)
 						return
 					}
 
@@ -374,7 +411,7 @@ func (h *Honeycast) bucketFind(bucket []byte, w http.ResponseWriter, r *http.Req
 
 				res.Events = filteredEvents
 			} else {
-				res.Events = events
+				res.Events = eventRes.Events
 			}
 		}
 
@@ -393,8 +430,8 @@ func (h *Honeycast) bucketFind(bucket []byte, w http.ResponseWriter, r *http.Req
 
 // Index handles the servicing of index based requests for the giving service.
 func (h *Honeycast) Index(w http.ResponseWriter, r *http.Request, params map[string]string) {
-	if h.assets != nil {
-		h.assets.ServeHTTP(w, r)
+	if h.Assets != nil {
+		h.Assets.ServeHTTP(w, r)
 		return
 	}
 
@@ -419,7 +456,7 @@ type targetMessage struct {
 // websocket structure.
 type Socketcast struct {
 	uprader      websocket.Upgrader
-	transport    *SocketTransport
+	GetEventReqs chan bolt.GetRequest
 	clients      map[*websocket.Conn]bool
 	newClients   chan *websocket.Conn
 	closeClients chan *websocket.Conn
@@ -432,8 +469,9 @@ type Socketcast struct {
 }
 
 // NewSocketcast returns a new instance of a Socketcast.
-func NewSocketcast(config *config.Config, db *Bolted, origins func(*http.Request) bool) *Socketcast {
+func NewSocketcast(config *config.Config, gprs chan bolt.GetRequest, origins func(*http.Request) bool) *Socketcast {
 	var socket Socketcast
+	socket.GetEventReqs = gprs
 
 	socket.uprader = websocket.Upgrader{
 		ReadBufferSize:  maxBufferSize,
@@ -448,7 +486,6 @@ func NewSocketcast(config *config.Config, db *Bolted, origins func(*http.Request
 	socket.sessions = make(chan []event.Event, 0)
 	socket.newClients = make(chan *websocket.Conn, 0)
 	socket.closeClients = make(chan *websocket.Conn, 0)
-	socket.transport = SocketTransportWithDB(config, db)
 
 	// spin up the socket internal processes.
 	go socket.manage()
@@ -508,7 +545,7 @@ func (socket *Socketcast) manage() {
 					break mloop
 				}
 
-				if err := socket.transport.HandleMessage(message.message, message.client); err != nil {
+				if err := handleMessage(socket.GetEventReqs, message.message, message.client); err != nil {
 					log.Error("Honeycast API : Failed to process message : %+q : %+q", message, err)
 				}
 
@@ -531,7 +568,12 @@ func (socket *Socketcast) manage() {
 				}
 
 				for client := range socket.clients {
-					if err := socket.transport.DeliverNewEvents(newEvents, client); err != nil {
+					err := deliverMessage(Message{
+						Type:    NewEvents,
+						Payload: newEvents,
+					}, client)
+
+					if err != nil {
 						log.Error("Honeycast API : Failed to deliver events : %+q : %+q", client.RemoteAddr(), err)
 					}
 				}
@@ -543,7 +585,12 @@ func (socket *Socketcast) manage() {
 				}
 
 				for client := range socket.clients {
-					if err := socket.transport.DeliverNewSessions(newEvents, client); err != nil {
+					err := deliverMessage(Message{
+						Type:    NewSessions,
+						Payload: newEvents,
+					}, client)
+
+					if err != nil {
 						log.Error("Honeycast API : Failed to deliver events : %+q : %+q", client.RemoteAddr(), err)
 					}
 				}
@@ -599,42 +646,9 @@ func (socket *Socketcast) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 //=============================================================================================
 
-// SocketTransport defines a struct which implements a message consumption and
-// response transport for use over a websocket connection.
-type SocketTransport struct {
-	bolted *Bolted
-	config *config.Config
-}
-
-// SocketTransportWithDB returns a new instance of a SocketTransport using the provided
-// Bolted instance.
-func SocketTransportWithDB(config *config.Config, bolt *Bolted) *SocketTransport {
-	var socket SocketTransport
-	socket.config = config
-	socket.bolted = bolt
-	return &socket
-}
-
-// NewSocketTransport returns a new instance of a SocketTransport.
-func NewSocketTransport(config *config.Config) (*SocketTransport, error) {
-	var socket SocketTransport
-	socket.config = config
-
-	// Create the database we desire.
-	bolted, err := NewBolted(fmt.Sprintf("%s-bolted", config.Token), event.ContainersSensorName, event.ConnectionSensorName, event.ServiceSensorName, event.SessionSensorName, event.PingSensorName, event.DataSensorName, event.ErrorsSensorName, event.EventSensorName)
-	if err != nil {
-		log.Errorf("Failed to created BoltDB session: %+q", err)
-		return nil, err
-	}
-
-	socket.bolted = bolted
-
-	return &socket, nil
-}
-
-// HandleMessage defines a central method which provides the entry point which is used
+// handleMessage defines a central method which provides the entry point which is used
 // to respond to new messages.
-func (so *SocketTransport) HandleMessage(message []byte, conn *websocket.Conn) error {
+func handleMessage(hc chan bolt.GetRequest, message []byte, conn *websocket.Conn) error {
 	var newMessage Message
 
 	if err := json.NewDecoder(bytes.NewBuffer(message)).Decode(&newMessage); err != nil {
@@ -649,69 +663,67 @@ func (so *SocketTransport) HandleMessage(message []byte, conn *websocket.Conn) e
 		var message Message
 		message.Type = FetchEventsReply
 
-		var terr error
-		message.Payload, terr = so.bolted.Get(eventsBucket, -1, -1)
-		if terr != nil {
-			log.Error("Honeycast API : Invalid Response with Sessions Retrieval : %+q", terr)
-			return so.DeliverMessage(Message{
+		resChan := make(chan bolt.GetResponse)
+
+		hc <- bolt.GetRequest{
+			From:     -1,
+			Total:    -1,
+			Response: resChan,
+			Bucket:   eventsBucket,
+		}
+
+		bucketResponse := <-resChan
+
+		if bucketResponse.Error != nil {
+			log.Error("Honeycast API : Invalid Response with Sessions Retrieval : %+q", bucketResponse.Error)
+
+			return deliverMessage(Message{
 				Type:    ErrorResponse,
-				Payload: terr.Error(),
+				Payload: bucketResponse.Error.Error(),
 			}, conn)
 		}
 
-		return so.DeliverMessage(message, conn)
+		message.Payload = bucketResponse.Events
+
+		return deliverMessage(message, conn)
 
 	case FetchSessions:
 		var message Message
 		message.Type = FetchSessionsReply
 
-		var terr error
-		message.Payload, terr = so.bolted.Get(sessionBucket, -1, -1)
-		if terr != nil {
-			log.Error("Honeycast API : Invalid Response with Sessions Retrieval : %+q", terr)
-			return so.DeliverMessage(Message{
+		resChan := make(chan bolt.GetResponse)
+
+		hc <- bolt.GetRequest{
+			From:     -1,
+			Total:    -1,
+			Response: resChan,
+			Bucket:   sessionBucket,
+		}
+
+		bucketResponse := <-resChan
+
+		if bucketResponse.Error != nil {
+			log.Error("Honeycast API : Invalid Response with Sessions Retrieval : %+q", bucketResponse.Error)
+
+			return deliverMessage(Message{
 				Type:    ErrorResponse,
-				Payload: terr.Error(),
+				Payload: bucketResponse.Error.Error(),
 			}, conn)
 		}
 
-		return so.DeliverMessage(message, conn)
+		return deliverMessage(message, conn)
 
 	default:
-		return so.DeliverMessage(Message{
+		return deliverMessage(Message{
 			Type:    ErrorResponse,
 			Payload: "Unknown Request Type",
 		}, conn)
 	}
 }
 
-// DeliverNewSessions delivers new incoming requests to the underline socket transport.
-func (so *SocketTransport) DeliverNewSessions(events []event.Event, conn *websocket.Conn) error {
-	if events == nil {
-		return nil
-	}
-
-	return so.DeliverMessage(Message{
-		Type:    NewSessions,
-		Payload: events,
-	}, conn)
-}
-
-// DeliverNewEvents delivers new incoming requests to the underline socket transport.
-func (so *SocketTransport) DeliverNewEvents(events []event.Event, conn *websocket.Conn) error {
-	if events == nil {
-		return nil
-	}
-
-	return so.DeliverMessage(Message{
-		Type:    NewEvents,
-		Payload: events,
-	}, conn)
-}
-
-// DeliverMessage defines a method which handles the delivery of a message to a giving
+// deliverMessage defines a method which handles the delivery of a message to a giving
 // websocket.Conn.
-func (so *SocketTransport) DeliverMessage(message Message, conn *websocket.Conn) error {
+func deliverMessage(message Message, conn *websocket.Conn) error {
 	var bu bytes.Buffer
 
 	if err := json.NewEncoder(&bu).Encode(message); err != nil {
